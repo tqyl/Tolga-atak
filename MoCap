@@ -1,0 +1,195 @@
+#define SERIAL_OUT              // Serial out
+#define INTERRUPT_PIN 15        // NodeMCU D8 pin 
+#define CALIBRATION_QUALITY 10   // Kalibrasyon kalitesi
+#define SENSOR_NUM 2
+
+#define WIFI_ID F("CB-Hotspot") // F = Harvard Arc. Data kÄ±smÄ±
+#define WIFI_PASSWD F("Show must go on!")
+
+//      ESP LIBS
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <Esp.h>
+#include <WiFiUdp.h>
+//      ESP LIBS
+
+//      I2C LIBS
+#include "I2Cdev.h" // MPU nun standart iÅŸleri iÃ§in (mpu bul, mpu register yazdÄ±r)
+#include "MPU6050_6Axis_MotionApps_V6_12.h" // MPU DMP LIB // quat iÃ§in
+#include "Wire.h" // SCL SDA ayarlama iÃ§in
+//      I2C LIBS
+
+WiFiUDP UDP;
+#define SERVER_PORT 6666
+#define CLIENT_PORT 8888
+
+MPU6050 MPUs[SENSOR_NUM]; // MPU6050 array i 2 tane
+
+// MPU control/status vars
+bool dmpFlag0 = false;  // set true if DMP init was successful
+bool dmpFlag1 = false;
+// FIFO storage buffer
+uint8_t fifoBuffer[28]; // optimized for quations (we need 16 byte buffer) //default 64 byte
+
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void IRAM_ATTR dmpDataReady() {
+  mpuInterrupt = true;
+}
+
+void init_sensor_DMP(MPU6050& sensor, bool dmpFlag, uint8_t addr);
+void printQuat(MPU6050& sensor, char c);
+void calibrate(MPU6050* sensor, uint8_t times);
+
+// ================================================================
+// ===                      SETUP                       ===
+// ================================================================
+
+void setup() {
+    
+    Serial.begin(115200);
+
+//  WIFI | UDP  
+    WiFi.mode(WIFI_STA); // station mode
+    WiFi.begin(WIFI_ID, WIFI_PASSWD); //connect WiFi
+    
+    #ifdef SERIAL_OUT
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print('.');
+        delay(500);
+    }
+    Serial.print(F("Connected! IP address: "));
+    Serial.println(WiFi.localIP());
+    Serial.print(F("UDP server on port: "));
+    Serial.println(SERVER_PORT);
+    #endif
+    
+    UDP.begin(SERVER_PORT);
+//  WIFI | UDP
+
+//  I2C
+    Wire.begin();
+    Wire.setClock(800000); // 8KHz SCL
+
+    pinMode(INTERRUPT_PIN, INPUT);
+    
+    for (size_t i = 0; i < SENSOR_NUM; i+=2) {
+        init_sensor_DMP(MPUs[i] = MPU6050(0x68), dmpFlag0, 0x68);
+        init_sensor_DMP(MPUs[i+1] = MPU6050(0x69), dmpFlag1, 0x69);
+    }
+    
+//  I2C
+
+}
+
+
+// ================================================================
+// ===                    MAIN PROGRAM LOOP                     ===
+// ================================================================
+char packet;
+
+void loop() {
+    if (dmpFlag0 || dmpFlag1) return; // if programming failed, don't try to do anything
+    
+    while(!UDP.parsePacket()) // wait data from socket
+    
+    UDP.read(&packet, 1);
+    
+    switch (char c = packet) {
+        case 'c': //calibrate
+            calibrate(MPUs,CALIBRATION_QUALITY);
+        break;
+        
+        default:
+            if(isDigit(c)){
+                uint8_t sensor_index = atoi(&c);
+                if(sensor_index < SENSOR_NUM) printQuat(MPUs[sensor_index], c);
+            }
+    }
+    
+    #ifdef SERIAL_OUT
+    Serial.println(packet);
+    Serial.println(F("Loop"));
+    #endif
+}
+
+void init_sensor_DMP(MPU6050& sensor, bool dmpFlag, uint8_t addr) {
+    uint8_t devStatus = sensor.dmpInitialize();
+    // return status after each device operation (0 = success, !0 = error)
+    if (devStatus == 0) {
+
+      // turn on the DMP, now that it's ready
+      sensor.setDMPEnabled(true);
+      // enable Arduino interrupt detection
+      Serial.print(F("Enabling interrupt "));
+      Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+      Serial.println(F(")..."));
+      attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+      // set our DMP Ready flag so the main loop() function knows it's okay to use it
+      Serial.println(F("DMP ready!"));
+      dmpFlag = true;
+
+    } else {
+
+      Serial.print(F("DMP Initialization failed (code "));
+      Serial.print(devStatus);
+      Serial.print(F(")"));
+      Serial.println(addr);
+    }
+}
+
+
+void printQuat(MPU6050& sensor, char c){
+    // read a packet from FIFO
+    // Get the Latest packet
+    
+    if (sensor.GetCurrentFIFOPacket(fifoBuffer, 28)){
+        sensor.dmpGetQuaternion(&q, fifoBuffer);
+        
+        
+        String quat(q.w);
+        quat.concat(',');
+        quat.concat(q.y);
+        quat.concat(',');
+        quat.concat(q.x);
+        quat.concat(',');
+        quat.concat(q.z);
+        quat.concat(',');
+        quat.concat(c);
+        quat.concat(';');
+        
+        
+        UDP.beginPacket(UDP.remoteIP(), CLIENT_PORT);
+        UDP.write(quat.c_str());
+        UDP.endPacket();
+        
+        #ifdef SERIAL_OUT
+        Serial.println(quat);
+        #endif
+    }
+    else{
+        
+        #ifdef SERIAL_OUT
+        Serial.print("ERROR! ");
+        Serial.println(c);
+        #endif
+        
+        delayMicroseconds(10); //wait FIFO fill
+        printQuat(sensor, c);
+    }
+}
+
+
+void calibrate(MPU6050* sensor, uint8_t times){
+    for (size_t i = 0; i < SENSOR_NUM; i++) {    
+        sensor[i].dmpInitialize();
+        sensor[i].CalibrateAccel(times);
+        sensor[i].CalibrateGyro(times);
+        sensor[i].PrintActiveOffsets();
+        sensor[i].setDMPEnabled(true);
+    }
+}
